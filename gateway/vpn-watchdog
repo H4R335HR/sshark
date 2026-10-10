@@ -1,0 +1,9 @@
+#!/bin/bash
+# vpn-watchdog — run every 2 min by vpn-watchdog.timer.
+# Tunnel healthy → do nothing. Tunnel dead → least-loaded location in the same
+# country, else least-loaded anywhere. Never switches a working tunnel.
+ping -c3 -W3 -I wg0 1.1.1.1 >/dev/null 2>&1 && exit 0
+CUR=$(cat /etc/wireguard/ss-current 2>/dev/null)
+CC=${CUR%%-*}                     # "sg-sng.prod.surfshark.com" → "sg"
+logger -t vpn-watchdog "tunnel dead on ${CUR:-unknown}, failing over"
+/usr/local/sbin/sshark best "$CC" || /usr/local/sbin/sshark best

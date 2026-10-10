@@ -1,0 +1,6 @@
+[Unit]
+Description=Check the Surfshark tunnel and fail over if it is dead
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-watchdog

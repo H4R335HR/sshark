@@ -1,0 +1,6 @@
+# Never commit WireGuard material
+*.conf
+!gateway/dnsmasq-surf.conf
+ss-current
+servers.json
+__pycache__/

@@ -1,0 +1,182 @@
+#!/bin/bash
+# sshark — Surfshark WireGuard server browser/switcher for a Linux VPN gateway
+#
+#   sshark list [filter]       all locations, live load %, least loaded first
+#   sshark regions             location count and average load per region
+#   sshark ping [filter]       latency to each matching endpoint (bypasses tunnel)
+#   sshark connect <target>    switch to a location: code (sg-sng), city or country
+#   sshark best [filter]       switch to the least-loaded match (e.g. "best japan")
+#   sshark status              current location, its load now, handshake, exit IP
+#
+# Filters match country, city, region or hostname (case-insensitive substring).
+# A 2-letter filter is a code and matches exactly: 'lu' = Luxembourg, 'uk' = UK hosts.
+# Switching is a hot peer swap (wg set): the interface, routes and kill-switch
+# stay up, so clients see a blip of a second or two, not a reconnect.
+
+set -euo pipefail
+
+API="https://api.surfshark.com/v4/server/clusters/generic"
+IFACE="wg0"
+WGDIR="/etc/wireguard"
+BASE="$WGDIR/ss-base.conf"          # [Interface] block only: PrivateKey + Address
+CONF="$WGDIR/$IFACE.conf"           # generated; don't hand-edit
+CUR="$WGDIR/ss-current"             # hostname of the active location
+CACHE="/var/cache/sshark/servers.json"
+FWMARK=51820                        # wg-quick's default mark; marked packets skip the tunnel
+
+die() { echo "sshark: $*" >&2; exit 1; }
+
+fetch() {
+  mkdir -p "$(dirname "$CACHE")"
+  if [[ -n "${SSHARK_API_FILE:-}" ]]; then cp "$SSHARK_API_FILE" "$CACHE.tmp"
+  elif ! curl -fsS --max-time 10 "$API" -o "$CACHE.tmp"; then
+    [[ -s "$CACHE" ]] || die "server list unreachable and no cache"
+    echo "(API unreachable; using cached list from $(date -r "$CACHE" '+%F %H:%M'))" >&2
+    return
+  fi
+  jq -e 'type=="array" and length>0' "$CACHE.tmp" >/dev/null || die "unexpected API response"
+  mv "$CACHE.tmp" "$CACHE"
+}
+
+# matching servers as TSV: load  host  country  city  region  tags  pubkey   (least loaded first)
+servers() {
+  local f="${1:-}"
+  jq -r --arg f "${f,,}" '
+    map(select($f == "" or
+        (if ($f | test("^[a-z]{2}$"))
+         # 2 letters = a code: match host prefix ("uk-") or country code exactly,
+         # so "lu" means Luxembourg, not Kuala LUmpur; "us" will not hit Cyprus or Belarus
+         then ((.connectionName | startswith($f + "-")) or ((.countryCode | ascii_downcase) == $f))
+         else ([.country, .countryCode, .location, .region, .connectionName]
+               | map(ascii_downcase) | any(contains($f))) end)))
+    | sort_by(.load)[]
+    | [.load, .connectionName, .country, .location, .region,
+       ((.tags // []) | map(select(. == "virtual" or . == "p2p")) | join(",") | if . == "" then "-" else . end),
+       .pubKey]   # never emit an empty field: bash "read" collapses consecutive tabs
+    | @tsv' "$CACHE"
+}
+
+exitip() { curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || echo '?'; }
+
+current() { [[ -f "$CUR" ]] && cat "$CUR" || echo ""; }
+
+bar() { local n=$(( ($1 + 5) / 10 )) b=""; (( n > 10 )) && n=10; for ((i=0; i<n; i++)); do b+="#"; done; printf '%-10s' "$b"; }
+
+cmd_list() {
+  fetch
+  local cur; cur=$(current)
+  printf '  %-4s %-10s  %-26s %-20s %-20s %s\n' LOAD "" HOST COUNTRY CITY TAGS
+  servers "${1:-}" | while IFS=$'\t' read -r load host country city region tags _; do
+    mark=" "; [[ "$host" == "$cur" ]] && mark="*"
+    printf '%s %3s%% %s  %-26s %-20.20s %-20.20s %s\n' "$mark" "$load" "$(bar "$load")" \
+      "${host%.prod.surfshark.com}" "$country" "$city" "$tags"
+  done
+  echo "  (* = active · load is per location, not per individual server · virtual = IP from that country, hardware elsewhere)"
+}
+
+cmd_regions() {
+  fetch
+  jq -r 'group_by(.region)[] | [.[0].region, length, ((map(.load)|add)/length|floor)] | @tsv' "$CACHE" |
+    sort -t$'\t' -k3 -n |
+    awk -F'\t' 'BEGIN{printf "%-24s %9s %8s\n","REGION","LOCATIONS","AVG LOAD"}
+                {printf "%-24s %9d %7d%%\n",$1,$2,$3}'
+}
+
+cmd_ping() {
+  [[ -n "${1:-}" ]] || die "give a filter, e.g. 'sshark ping asia pacific' (pinging every location takes a while)"
+  fetch
+  printf '%-26s %6s %8s\n' HOST LOAD RTT
+  servers "$1" | while IFS=$'\t' read -r load host _; do
+    # -m marks packets so they leave via eth0 like WireGuard's own handshakes, not through the tunnel
+    rtt=$(ping -m "$FWMARK" -c3 -i0.3 -W2 -q "$host" 2>/dev/null | awk -F/ '/^rtt/{printf "%.0f",$5}')
+    printf '%s\t%s\t%s\n' "${rtt:-99999}" "${host%.prod.surfshark.com}" "$load"
+  done | sort -n | while IFS=$'\t' read -r rtt host load; do
+    [[ "$rtt" == 99999 ]] && rtt="timeout" || rtt="$rtt ms"
+    printf '%-26s %5s%% %8s\n' "$host" "$load" "$rtt"
+  done
+}
+
+apply() {   # $1=host  $2=pubkey
+  local host=$1 key=$2
+  [[ -f "$BASE" ]] || die "$BASE missing (needs your [Interface] PrivateKey + Address)"
+  umask 077
+  { cat "$BASE"; printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s:51820\nPersistentKeepalive = 25\n' "$key" "$host"; } > "$CONF.tmp"
+  mv "$CONF.tmp" "$CONF"
+  if ip link show "$IFACE" &>/dev/null; then
+    # Hot swap with 'wg set', NOT 'wg syncconf': syncconf applies the stripped config,
+    # which has no FwMark, so it clears the mark wg-quick set. Unmarked handshakes then
+    # get routed into wg0 itself and never reach the new server ("Handshake: never").
+    local old
+    for old in $(wg show "$IFACE" peers); do
+      [[ "$old" == "$key" ]] || wg set "$IFACE" peer "$old" remove
+    done
+    wg set "$IFACE" fwmark "$FWMARK" peer "$key" endpoint "$host:51820" \
+      allowed-ips 0.0.0.0/0 persistent-keepalive 25
+  else
+    systemctl restart "wg-quick@$IFACE"   # restart, not start: a manual 'wg-quick down' leaves the unit 'active'
+  fi
+  echo "$host" > "$CUR"
+  echo -n "Switching to ${host%.prod.surfshark.com} … "
+  for _ in 1 2 3 4 5 6; do
+    sleep 1
+    if ping -c1 -W2 -I "$IFACE" 1.1.1.1 &>/dev/null; then
+      echo "up. Exit IP: $(exitip)"
+      return 0
+    fi
+  done
+  echo "NOT passing traffic yet — check 'sshark status' or try another location"
+  return 1
+}
+
+pick() {   # resolve a target to "load host ... pubkey"; exact host/code beats substring
+  local t="${1,,}" line
+  line=$(servers "" | awk -F'\t' -v t="$t" '$2==t || $2==t".prod.surfshark.com"' | head -1)
+  [[ -n "$line" ]] || line=$(servers "$t" | head -1)
+  [[ -n "$line" ]] || die "no location matches '$1' (try 'sshark list $1')"
+  echo "$line"
+}
+
+cmd_connect() {
+  [[ -n "${1:-}" ]] || die "usage: sshark connect <code|city|country>"
+  fetch
+  local line; line=$(pick "$*")
+  IFS=$'\t' read -r load host country city _ _ key <<<"$line"
+  echo "$city, $country — load ${load}%"
+  apply "$host" "$key"
+}
+
+cmd_best() {
+  fetch
+  local line; line=$(servers "${*:-}" | head -1)
+  [[ -n "$line" ]] || die "no location matches '${*:-}'"
+  IFS=$'\t' read -r load host country city _ _ key <<<"$line"
+  echo "Least loaded${1:+ matching '$*'}: $city, $country (${load}%)"
+  apply "$host" "$key"
+}
+
+cmd_status() {
+  local cur; cur=$(current)
+  [[ -n "$cur" ]] || { echo "No location selected yet. Try: sshark best singapore"; return; }
+  fetch 2>/dev/null || true
+  local load; load=$(jq -r --arg h "$cur" '.[] | select(.connectionName==$h) | .load' "$CACHE" 2>/dev/null)
+  echo "Location : ${cur%.prod.surfshark.com}  (load now: ${load:-?}%)"
+  if ! ip link show "$IFACE" &>/dev/null; then echo "Tunnel   : DOWN"; return; fi
+  local hs; hs=$(wg show "$IFACE" latest-handshakes | awk '{print $2}')
+  if [[ "${hs:-0}" -gt 0 ]]; then echo "Handshake: $(( $(date +%s) - hs ))s ago"; else echo "Handshake: never"; fi
+  wg show "$IFACE" transfer | awk '{printf "Transfer : %.1f MB down, %.1f MB up\n",$2/1048576,$3/1048576}'
+  if ping -c2 -W2 -I "$IFACE" 1.1.1.1 &>/dev/null; then
+    echo "Traffic  : OK — exit IP $(exitip)"
+  else
+    echo "Traffic  : NOT PASSING"
+  fi
+}
+
+case "${1:-}" in
+  list|ls)  shift; cmd_list "$*" ;;
+  regions)  cmd_regions ;;
+  ping)     shift; cmd_ping "$*" ;;
+  connect|c) shift; cmd_connect "$@" ;;
+  best|b)   shift; cmd_best "$@" ;;
+  status|s|"") cmd_status ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
